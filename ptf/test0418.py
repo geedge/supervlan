@@ -40,7 +40,7 @@ class BaseProgramTest(BfRuntimeTest):
     #     nexthop
     def setUp(self):
         self.client_id = 0
-        self.p4_name = "super_vlan_test"
+        self.p4_name = "super_vlan"
         self.dev      = 0
         self.dev_tgt  = gc.Target(self.dev, pipe_id=0xFFFF)
         
@@ -91,7 +91,12 @@ class BaseProgramTest(BfRuntimeTest):
         self.nexthop.info.data_field_annotation_add(
             "new_mac_sa", "Ingress.l3_switch", "mac")
 
-        self.tables = [ self.is_l2_switch, self.Trunk_switch, self.Port_to_srcvid, self.dstIP_to_dstvid, self.src_supervid_to_mac, self.ipv4_host, self.ipv4_lpm, self.nexthop ]
+        self.egr_vlan_port = self.bfrt_info.table_get("Egress.egr_vlan_port")
+        self.egr_vlan_port.info.key_field_annotation_add(
+            "meta.vid", "int")
+        
+
+        self.tables = [ self.is_l2_switch, self.Trunk_switch, self.Port_to_srcvid, self.dstIP_to_dstvid, self.src_supervid_to_mac, self.ipv4_host, self.ipv4_lpm, self.nexthop, self.egr_vlan_port ]
 
         # Create a list of all ports available on the device
         self.swports = []
@@ -447,6 +452,17 @@ class HostL3Switch(BaseProgramTest):
         self.is_l2_switch.entry_add(self.dev_tgt, key_list, data_list);
         print("  Added an entry to is_l2_switch: {} --> l3_switch()".
               format(dst_addr))
+
+        key_list = [
+            self.egr_vlan_port.make_key([
+                gc.KeyTuple('meta.vid', src_subvid),
+                gc.KeyTuple('egress_port', egress_port)])
+            ]
+        data_list = [
+            self.egr_vlan_port.make_data([], "Egress.send_untagged")
+            ]
+
+        self.egr_vlan_port.entry_add(self.dev_tgt, key_list, data_list);
 
         #
         # Prepare the test packet and the expected packet
