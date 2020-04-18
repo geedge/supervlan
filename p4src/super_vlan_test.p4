@@ -64,6 +64,7 @@ header ethernet_h {
 }
 
 header vlan_tag_h {
+    bit<16>  tpid;
     bit<3>        pcp;
     bit<1>        cfi;
     bit<12>       vid;
@@ -110,7 +111,17 @@ header arp_ipv4_h {
     ipv4_addr_t  dst_proto_addr;
 }
 
+typedef bit<4> header_type_t; /* These fields can be coombined into one      */
+typedef bit<4> header_info_t; /* 8-bit field as well. Exercise for the brave */
+const header_type_t HEADER_TYPE_BRIDGE         = 0xB;
 
+#define INTERNAL_HEADER         \
+    header_type_t header_type;  \
+    header_info_t header_info
+    
+header inthdr_h {
+    INTERNAL_HEADER;
+}
 
 /*************************************************************************
  **************  I N G R E S S   P R O C E S S I N G   *******************
@@ -118,7 +129,20 @@ header arp_ipv4_h {
  
     /***********************  H E A D E R S  ************************/
 
+header bridge_h {
+    INTERNAL_HEADER;
+    
+    bit<7>    pad0;
+    PortId_t  ingress_port;
+
+    bit<3>        pcp;
+    bit<1>        cfi;
+    bit<12>       vid;
+}
+
 struct my_ingress_headers_t {
+    bridge_h     bridge;
+
     ethernet_h         ethernet;
     vlan_tag_h[2]      vlan_tag;
     arp_h              arp;
@@ -130,6 +154,11 @@ struct my_ingress_headers_t {
     /******  G L O B A L   I N G R E S S   M E T A D A T A  *********/
 
 struct my_ingress_metadata_t {
+    bit<3>        pcp;
+    bit<1>        cfi;
+    bit<12>       vid;
+    PortId_t ingress_port;
+
     ipv4_addr_t   dst_ipv4;
     mac_addr_t    dst_mac;
     subvlan_id_t  src_subvid;
@@ -155,6 +184,11 @@ parser IngressParser(packet_in      pkt,
     }
 
     state meta_init {
+        meta.pcp            = 0;
+        meta.cfi            = 0;
+        meta.vid            = 0;
+
+        meta.src_subvid    = 0;
         meta.ipv4_csum_err = 0;
         meta.dst_ipv4      = 0;
         meta.dst_mac       = 0;
@@ -458,6 +492,14 @@ control Ingress(
             }
             forward_or_respond.apply();
         }
+
+        hdr.bridge.setValid();
+        hdr.bridge.header_type  = HEADER_TYPE_BRIDGE;
+        hdr.bridge.header_info  = 0;                           /* Ignore */
+        hdr.bridge.ingress_port = ig_intr_md.ingress_port;
+        hdr.bridge.pcp          = meta.pcp;
+        hdr.bridge.cfi          = meta.cfi;
+        hdr.bridge.vid          = meta.src_subvid;
     }
 }
 
@@ -499,11 +541,19 @@ control IngressDeparser(packet_out pkt,
     /***********************  H E A D E R S  ************************/
 
 struct my_egress_headers_t {
+    ethernet_h ethernet;
+    vlan_tag_h vlan_tag;
 }
 
     /********  G L O B A L   E G R E S S   M E T A D A T A  *********/
 
 struct my_egress_metadata_t {
+    bridge_h          bridge;
+
+    PortId_t          ingress_port;
+    bit<3>            pcp;
+    bit<1>            cfi;
+    bit<12>           vid;
 }
 
     /***********************  P A R S E R  **************************/
@@ -516,8 +566,36 @@ parser EgressParser(packet_in        pkt,
     out egress_intrinsic_metadata_t  eg_intr_md)
 {
     /* This is a mandatory state, required by Tofino Architecture */
+    inthdr_h inthdr;
+    
+    /* This is a mandatory state, required by Tofino Architecture */
     state start {
         pkt.extract(eg_intr_md);
+        inthdr = pkt.lookahead<inthdr_h>();
+        transition select(inthdr.header_type, inthdr.header_info) {
+            ( HEADER_TYPE_BRIDGE,         _ ) : parse_bridge;
+            default : reject;
+        }
+    }
+
+    state parse_bridge {
+        pkt.extract(meta.bridge);
+        meta.ingress_port = meta.bridge.ingress_port;
+        meta.pcp = meta.bridge.pcp;
+        meta.cfi = meta.bridge.cfi;
+        meta.vid = meta.bridge.vid;
+        transition parse_ethernet;
+    }
+    
+    state parse_ethernet {
+        pkt.extract(hdr.ethernet);
+        transition select(pkt.lookahead<bit<16>>()) {
+            (bit<16>)ether_type_t.TPID &&& 0xEFFF: parse_vlan_tag;
+            default: accept;
+        }
+    }
+    state parse_vlan_tag {
+        pkt.extract(hdr.vlan_tag);
         transition accept;
     }
 }
@@ -534,7 +612,55 @@ control Egress(
     inout egress_intrinsic_metadata_for_deparser_t     eg_dprsr_md,
     inout egress_intrinsic_metadata_for_output_port_t  eg_oport_md)
 {
-    apply {
+    action drop() {
+        eg_dprsr_md.drop_ctl = eg_dprsr_md.drop_ctl | 1;
+    }
+
+    action send_tagged() {
+        hdr.vlan_tag.setValid();
+        hdr.vlan_tag.tpid = (bit<16>)ether_type_t.TPID;
+#ifdef P4C_1719_FIXED
+        hdr.vlan_tag.pcp  = meta.pcp;
+        hdr.vlan_tag.cfi  = meta.cfi;
+#else
+        hdr.vlan_tag.pcp  = 0;
+        hdr.vlan_tag.cfi  = 0;
+#endif
+        hdr.vlan_tag.vid  = meta.vid;
+    }
+    
+    action send_untagged() {
+        hdr.vlan_tag.setInvalid();
+    }
+
+    action not_a_member() {
+        drop();
+    }
+    
+    table egr_vlan_port {
+        key = {
+            meta.vid                    : exact;
+            eg_intr_md.egress_port[6:0] : exact @name("egress_port");
+        }
+        actions = {
+            send_tagged;
+            send_untagged;
+            not_a_member;
+        }
+        default_action = not_a_member();
+        size = 512;
+    }
+    
+    apply {       
+#ifdef P4_SOURCE_PRUNING
+        if (meta.ingress_port == eg_intr_md.egress_port) {
+            drop();
+        } else {
+#endif
+            egr_vlan_port.apply();
+#ifdef P4_SOURCE_PRUNING
+        }
+#endif
     }
 }
 
